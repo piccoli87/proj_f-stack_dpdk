@@ -1,0 +1,5 @@
+# f-stack-fork/ is its own independent git repository (a real fork of
+# F-Stack with its own history and remote) — publish it separately, see
+# README.md "Publicando no GitHub". Not tracked as a submodule here on
+# purpose, to keep this repo's history simple.
+/f-stack-fork/

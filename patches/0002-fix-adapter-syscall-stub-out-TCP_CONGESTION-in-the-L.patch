@@ -1,0 +1,84 @@
+From 0f230692e332d96debaa8e665547a5ec819bd339 Mon Sep 17 00:00:00 2001
+From: nerds2 <pecolofilho@gmail.com>
+Date: Mon, 13 Jul 2026 17:24:23 -0300
+Subject: [PATCH 2/2] fix(adapter/syscall): stub out TCP_CONGESTION in the
+ LD_PRELOAD adapter
+
+The LD_PRELOAD syscall adapter (adapter/syscall/) lets unmodified
+Linux binaries run over F-Stack by hijacking socket syscalls, but it
+has no translation table entry for TCP_CONGESTION (Linux optname 13)
+the way linux2freebsd_ioctl() does for ioctl(). Forwarding it verbatim
+either hits an unrelated FreeBSD sockopt or fails outright, and tools
+like iperf3 (3.9+) unconditionally get/set this option even without
+-C, aborting the connection with "unable to set TCP_CONGESTION:
+Supplied congestion control algorithm not supported on this host".
+
+Since F-Stack fds only reach these hooks after CHECK_FD_OWNERSHIP has
+already confirmed the fd belongs to F-Stack, it's safe to no-op this
+specific option pair instead of forwarding it: ff_hook_setsockopt()
+now returns success without contacting the F-Stack backend, and
+ff_hook_getsockopt() reports back a plausible built-in algorithm name
+("newreno"). This does not let callers actually steer F-Stack's
+congestion control (there is still no real translation), but it lets
+standard tools complete a throughput test instead of aborting on
+setup.
+---
+ adapter/syscall/ff_hook_syscall.c | 35 +++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/adapter/syscall/ff_hook_syscall.c b/adapter/syscall/ff_hook_syscall.c
+index 984fd45d..38de844e 100644
+--- a/adapter/syscall/ff_hook_syscall.c
++++ b/adapter/syscall/ff_hook_syscall.c
+@@ -619,6 +619,28 @@ ff_hook_getsockopt(int fd, int level, int optname,
+     CHECK_FD_OWNERSHIP(getsockopt, (fd, level, optname,
+         optval, optlen));
+ 
++
++    /*
++     * TCP_CONGESTION (Linux optname 13) has no numeric translation to
++     * FreeBSD's own TCP_CONGESTION in this adapter (unlike ioctl, which has
++     * linux2freebsd_ioctl()), so forwarding it verbatim would hit an
++     * unrelated FreeBSD sockopt. Report a plausible built-in algorithm name
++     * so callers like iperf3 (which reads this before/instead of setting
++     * it) don't abort the connection.
++     */
++    if (level == 6 && optname == 13) {  /* IPPROTO_TCP, TCP_CONGESTION */
++        static const char cc_name[] = "newreno";
++        socklen_t cc_len = sizeof(cc_name);
++        if (optval != NULL && *optlen > 0) {
++            socklen_t copy_len = *optlen < cc_len ? *optlen : cc_len;
++            rte_memcpy(optval, cc_name, copy_len);
++            *optlen = copy_len;
++        } else {
++            *optlen = cc_len;
++        }
++        return 0;
++    }
++
+     DEFINE_REQ_ARGS(getsockopt);
+     void *sh_optval = NULL;
+     socklen_t *sh_optlen = NULL;
+@@ -674,6 +696,19 @@ ff_hook_setsockopt(int fd, int level, int optname,
+     CHECK_FD_OWNERSHIP(setsockopt, (fd, level, optname,
+         optval, optlen));
+ 
++    /*
++     * TCP_CONGESTION (Linux optname 13) has no numeric translation to
++     * FreeBSD's own TCP_CONGESTION in this adapter (unlike ioctl, which has
++     * linux2freebsd_ioctl()), so forwarding it verbatim hits an unrelated
++     * FreeBSD sockopt and fails. F-Stack fds only reach here, so this is
++     * safe to no-op: apps like iperf3 (v3.9+) unconditionally try to set
++     * it and abort the connection on failure, even without -C. We don't
++     * need to steer the cc algorithm for a throughput test.
++     */
++    if (level == 6 && optname == 13) {  /* IPPROTO_TCP, TCP_CONGESTION */
++        return 0;
++    }
++
+     DEFINE_REQ_ARGS_STATIC(setsockopt);
+     static __thread void *sh_optval = NULL;
+     static __thread socklen_t sh_optval_len = 0;
+-- 
+2.34.1
+

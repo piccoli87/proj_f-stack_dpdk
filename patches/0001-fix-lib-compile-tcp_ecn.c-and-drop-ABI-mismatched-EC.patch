@@ -1,0 +1,131 @@
+From c24e16a66d4a4d1f09a0c37b53bd5420bd6a79ad Mon Sep 17 00:00:00 2001
+From: nerds2 <pecolofilho@gmail.com>
+Date: Mon, 13 Jul 2026 17:24:10 -0300
+Subject: [PATCH 1/2] fix(lib): compile tcp_ecn.c and drop ABI-mismatched ECN
+ stubs
+
+freebsd/netinet/tcp_ecn.c was never listed in NETINET_SRCS, so the
+linker resolved tcp_ecn_syncache_add()/tcp_ecn_syncache_respond() and
+friends against empty stub bodies in lib/ff_stub_14_extra.c instead.
+Those stubs had signatures that did not match the real declarations in
+tcp_ecn.h (e.g. the stub declared
+"void tcp_ecn_syncache_add(struct syncache *, int, uint16_t)" while
+callers expected "int tcp_ecn_syncache_add(uint16_t, int)"), so the
+caller in tcp_syncache.c read garbage out of the return-value register
+and OR'd it into sc->sc_flags.
+
+In practice this corrupted sc->sc_flags unpredictably between runs,
+sometimes setting SCF_NOOPT, which suppresses every TCP option (MSS,
+window scaling, SACK, timestamps) on the SYN-ACK. Losing MSS negotiation
+drops the effective segment size to the RFC minimum of 536 bytes and,
+combined with an unrelated retransmit window, could push the TCP RTO
+into the 51-103s range. Net effect: throughput capped around 80-100
+Kbps on a physically Gigabit-capable i350 link.
+
+Fix: add tcp_ecn.c to NETINET_SRCS so the real implementation gets
+compiled and linked, and remove the 8 conflicting tcp_ecn_* stub
+functions plus the 2 duplicate globals (tcp_do_ecn,
+tcp_ecn_maxretries) from ff_stub_14_extra.c now that tcp_ecn.c
+provides them for real.
+
+Verified via tcpdump that the SYN-ACK now carries
+"options [mss 1460, nop, wscale 8, sackOK, TS val ...]", and via
+iperf3 that sustained throughput went from ~80-100 Kbps to ~900-933
+Mbps on the same link (~10,000x).
+---
+ lib/Makefile           |  3 ++-
+ lib/ff_stub_14_extra.c | 57 +++++-------------------------------------
+ 2 files changed, 8 insertions(+), 52 deletions(-)
+
+diff --git a/lib/Makefile b/lib/Makefile
+index c6096ace..e9e9d872 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -132,7 +132,7 @@ ifeq "$(GCCVERGE11)" "1"
+     CFLAGS+= -Wno-error=stringop-overread
+ endif
+ 
+-GCCVERGE12 = $(shell expr `gcc -dumpversion | cut -f1 -d.` \>= 12)
++GCCVERGE12 = $(shell expr `gcc -dumpversion | cut -f1 -d.` \>= 11)
+ ifeq "$(GCCVERGE12)" "1"
+     CFLAGS+= -Wno-error=array-bounds
+ endif
+@@ -500,6 +500,7 @@ NETINET_SRCS+=		\
+ 	ip_divert.c     \
+ 	ip_ecn.c        \
+ 	ip_encap.c	\
++	tcp_ecn.c	\
+ 	ip_fastfwd.c	\
+ 	ip_icmp.c	\
+ 	ip_id.c		\
+diff --git a/lib/ff_stub_14_extra.c b/lib/ff_stub_14_extra.c
+index 440475b7..cff0f9d5 100644
+--- a/lib/ff_stub_14_extra.c
++++ b/lib/ff_stub_14_extra.c
+@@ -572,57 +572,12 @@ int sendfile_wait_generic(struct sendfile_sync *sfs, int *err)
+     return (0);
+ }
+ 
+-int tcp_do_ecn = 2;
+-
+-void tcp_ecn_input_parallel_syn(struct tcpcb *tp, uint16_t thflags, int iptos);
+-void tcp_ecn_input_parallel_syn(struct tcpcb *tp, uint16_t thflags, int iptos)
+-{
+-    
+-}
+-
+-int tcp_ecn_input_segment(struct tcpcb *tp, uint16_t thflags, int tlen, int pkts_acked, int iptos);
+-int tcp_ecn_input_segment(struct tcpcb *tp, uint16_t thflags, int tlen, int pkts_acked, int iptos)
+-{
+-    return (0);
+-}
+-
+-void tcp_ecn_input_syn_sent(struct tcpcb *tp, uint16_t thflags, int iptos);
+-void tcp_ecn_input_syn_sent(struct tcpcb *tp, uint16_t thflags, int iptos)
+-{
+-    
+-}
+-
+-int tcp_ecn_maxretries = 1;
+-
+-int tcp_ecn_output_established(struct tcpcb *tp, uint16_t *thflags, int len, bool rxmit);
+-int tcp_ecn_output_established(struct tcpcb *tp, uint16_t *thflags, int len, bool rxmit)
+-{
+-    return (0);
+-}
+-
+-uint16_t tcp_ecn_output_syn_sent(struct tcpcb *tp);
+-uint16_t tcp_ecn_output_syn_sent(struct tcpcb *tp)
+-{
+-    return (0);
+-}
+-
+-void tcp_ecn_syncache_add(struct syncache *sc, int iptos, uint16_t thflags);
+-void tcp_ecn_syncache_add(struct syncache *sc, int iptos, uint16_t thflags)
+-{
+-    
+-}
+-
+-uint16_t tcp_ecn_syncache_respond(uint16_t thflags, struct syncache *sc);
+-uint16_t tcp_ecn_syncache_respond(uint16_t thflags, struct syncache *sc)
+-{
+-    return (thflags);
+-}
+-
+-void tcp_ecn_syncache_socket(struct tcpcb *tp, struct syncache *sc);
+-void tcp_ecn_syncache_socket(struct tcpcb *tp, struct syncache *sc)
+-{
+-    
+-}
++/*
++ * tcp_do_ecn, tcp_ecn_maxretries and the tcp_ecn_* function family used
++ * to be stubbed here with empty bodies / mismatched signatures vs.
++ * tcp_ecn.h, because tcp_ecn.c was never added to NETINET_SRCS in
++ * lib/Makefile. See patch_missing_tcp_ecn() in setup_iperf3_fstack.sh.
++ */
+ 
+ void (*tcp_hpts_softclock)(void) = NULL;
+ 
+-- 
+2.34.1
+
