@@ -1,0 +1,166 @@
+TOPDIR=../..
+
+ifeq ($(FF_PATH),)
+	FF_PATH=${TOPDIR}
+endif
+
+ifneq ($(shell pkg-config --exists libdpdk && echo 0),0)
+	$(error "No installation of DPDK found, maybe you should export environment variable `PKG_CONFIG_PATH`")
+endif
+
+#DEBUG=-O0 -gdwarf-2 -g3
+
+# Per thread separate initialization dpdk lib and attach sc when needed,
+# such as listen same port in different threads, and socket can use in own thread.
+# Default disable.
+#
+# If disable it, one socket can use in all threads.
+#FF_THREAD_SOCKET=1
+
+# Epoll polling mode, now only support freebsd socket, not support FF_KERNEL_EVENT.  
+# If disable it, epoll use sem_wait.
+#FF_PRELOAD_POLLING_MODE=1
+
+# Lock-free ring IPC mode, replace sem_wait/sem_post with rte_ring.
+# If enable it, FF_PRELOAD_POLLING_MODE must be disabled.
+#FF_USE_RING_IPC=1
+
+# If enable FF_KERNEL_EVENT, epoll_create/epoll_clt/epoll_wait always call f-stack and system API at the same time.
+# Use for some scenarios similar to Nginx.
+#FF_KERNEL_EVENT=1
+
+# If enable FF_USE_THREAD_STRUCT_HANDLE, every ff_so_context has one struct thread  handle in fstack, fork will be supported
+# like linux kernel.
+#FF_USE_THREAD_STRUCT_HANDLE=1
+
+# If FF_PRELOAD_SUPPORT_SELECT is enabled, we can use select in LD_PRELOAD mode. 
+# However, we need to set the value of FF_KERNEL_MAX_FD_SELECT based on our requirements to ensure file descriptors 
+# (FDs) for the user-space protocol stack can be covered by the select interface.
+#FF_PRELOAD_SUPPORT_SELECT=1
+#FF_KERNEL_MAX_FD_SELECT=128
+
+PKGCONF ?= pkg-config
+
+ifndef DEBUG
+	CFLAGS+= -g -O2 -DNDEBUG
+else
+	CFLAGS+= ${DEBUG}
+endif
+
+ifdef FF_THREAD_SOCKET
+	CFLAGS+= -DFF_THREAD_SOCKET
+endif
+
+ifdef FF_KERNEL_EVENT
+	CFLAGS+= -DFF_KERNEL_EVENT
+endif
+
+ifdef FF_MULTI_SC
+	CFLAGS+= -DFF_MULTI_SC
+endif
+
+ifdef FF_PRELOAD_POLLING_MODE
+	CFLAGS+= -DFF_PRELOAD_POLLING_MODE
+endif
+
+ifdef FF_USE_RING_IPC
+ifdef FF_PRELOAD_POLLING_MODE
+$(error "FF_USE_RING_IPC and FF_PRELOAD_POLLING_MODE are mutually exclusive")
+endif
+	CFLAGS+= -DFF_USE_RING_IPC
+endif
+
+# v3.3 H23 fix (D2): response path via sc->completion (same cache line as sc->result),
+# replacing rsp_ring enqueue. Always enabled as part of FF_USE_RING_IPC default behavior.
+
+# v3.3 H19-final fix (D5): inline rte_ring_empty fast-path check before
+# ff_ring_process_requests, avoiding the dequeue burst function call stack
+# when req_ring is empty. Reuses existing ring metadata, NO new cross-core
+# fields. Always enabled as part of FF_USE_RING_IPC default behavior.
+
+# v3.4 D6: inline dequeue burst + handler call within ff_handle_each_context,
+# eliminating ff_ring_process_requests() call stack and function pointer
+# indirection. NO new cross-core fields, only reduces local CPU.
+# Always enabled as part of FF_USE_RING_IPC default behavior.
+
+ifdef FF_USE_THREAD_STRUCT_HANDLE
+	CFLAGS+= -DFF_USE_THREAD_STRUCT_HANDLE
+endif
+
+ifdef FF_PRELOAD_SUPPORT_SELECT
+	CFLAGS+= -DFF_PRELOAD_SUPPORT_SELECT -DFF_KERNEL_MAX_FD_SELECT=$(FF_KERNEL_MAX_FD_SELECT) -DFF_USE_THREAD_STRUCT_HANDLE 
+endif
+
+CFLAGS += -fPIC -Wall -Werror $(shell $(PKGCONF) --cflags libdpdk)
+
+INCLUDES= -I. -I${FF_PATH}/lib
+
+LIBS+= -Wl,--no-whole-archive -lrt -lm -ldl -lcrypto -pthread -lnuma
+#LIBS+= -lmnl -lmlx5 -libverbs
+FF_LIBS= -L${FF_PATH}/lib -Wl,--whole-archive,-lfstack,--no-whole-archive
+
+DPDK_LIBS+= $(shell $(PKGCONF) --static --libs libdpdk)
+DPDK_LIBS+= ${LIBS}
+
+#DPDK_CFLAGS= -Wall -Werror -include ${FF_DPDK}/include/rte_config.h
+#DPDK_CFLAGS+= -march=native -DRTE_MACHINE_CPUFLAG_SSE -DRTE_MACHINE_CPUFLAG_SSE2 -DRTE_MACHINE_CPUFLAG_SSE3
+#DPDK_CFLAGS+= -DRTE_MACHINE_CPUFLAG_SSSE3 -DRTE_MACHINE_CPUFLAG_SSE4_1 -DRTE_MACHINE_CPUFLAG_SSE4_2
+#DPDK_CFLAGS+= -DRTE_COMPILE_TIME_CPUFLAGS=RTE_CPUFLAG_SSE,RTE_CPUFLAG_SSE2,RTE_CPUFLAG_SSE3,RTE_CPUFLAG_SSSE3,RTE_CPUFLAG_SSE4_1,RTE_CPUFLAG_SSE4_2
+#DPDK_CFLAGS+= -I${FF_DPDK}/include
+
+CFLAGS+= ${INCLUDES} ${DPDK_CFLAGS}
+
+FSTACK_LIBS= ${FF_LIBS} ${DPDK_LIBS}
+FF_SYSCALL_LIBS=
+
+FSTACK_SRCS=                  \
+	fstack.c                  \
+	ff_so_zone.c              \
+	ff_socket_ops.c
+
+ifdef FF_USE_RING_IPC
+FSTACK_SRCS += ff_ring_ipc.c
+endif
+
+FF_SYSCALL_SRCS=              \
+	ff_so_zone.c              \
+	ff_hook_syscall.c         \
+	ff_linux_syscall.c
+
+ifdef FF_USE_RING_IPC
+FF_SYSCALL_SRCS += ff_ring_ipc.c
+endif
+
+FSTACK_OBJS= $(patsubst %.c,%.o,${FSTACK_SRCS})
+
+FF_SYSCALL_OBJS= $(patsubst %.c,%.o,${FF_SYSCALL_SRCS})
+
+#TARGET= fstack libff_syscall.a
+TARGET= fstack libff_syscall.so example
+
+all: ${TARGET}
+
+fstack: ${FSTACK_OBJS}
+	cc -o $@ $^ ${FSTACK_LIBS}
+
+#libff_syscall.a: ${FF_SYSCALL_OBJS}
+libff_syscall.so: ${FF_SYSCALL_OBJS}
+	#ar -rcs $@ $^ ${FF_SYSCALL_LIBS}
+	${CC} -fPIC -shared -o $@ $^ ${FF_SYSCALL_LIBS} ${DPDK_LIBS}
+
+example:
+	cc ${CFLAGS} -I ${FF_PATH}/adapter/syscall -o helloworld_stack main_stack.c -L ${FF_PATH}/adapter/syscall -lff_syscall ${LIBS}
+	cc ${CFLAGS} -I ${FF_PATH}/adapter/syscall -o helloworld_stack_thread_socket main_stack_thread_socket.c -L ${FF_PATH}/adapter/syscall -lff_syscall ${LIBS}
+	cc ${CFLAGS} -I ${FF_PATH}/adapter/syscall -o helloworld_stack_epoll main_stack_epoll.c ${LIBS}
+	cc ${CFLAGS} -I ${FF_PATH}/adapter/syscall -o helloworld_stack_epoll_thread_socket main_stack_epoll_thread_socket.c ${LIBS}
+	cc ${CFLAGS} -I ${FF_PATH}/adapter/syscall -o helloworld_stack_epoll_kernel main_stack_epoll_kernel.c ${LIBS}
+
+${FSTACK_OBJS}: %.o: %.c
+	${CC} -c $(CFLAGS) ${PROF} $<
+
+${FF_SYSCALL_OBJS}: %.o: %.c
+	${CC} -c $(CFLAGS) ${PROF} $<
+
+.PHONY: clean
+clean:
+	rm -f *.o ${TARGET}

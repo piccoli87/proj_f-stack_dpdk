@@ -105,28 +105,13 @@ completo, incluindo o lado cliente e troubleshooting.
 > antes de compilar — então a correção não se perde mesmo que
 > `FSTACK_REPO_URL` aponte para o repositório oficial.
 
-## Publicando no GitHub
+## Publicado no GitHub
 
-Este diretório foi montado localmente para facilitar o upload — nenhum push
-foi feito ainda. Sugestão de dois repositórios (mantém o fork do F-Stack
-"limpo", só com o que é dele, separado da documentação/scripts que são
-originais deste projeto):
-
-```bash
-# Repositório 1 — o fork do F-Stack em si
-cd f-stack-fork
-git remote add myfork git@github.com:SEU_USUARIO/f-stack.git
-git push myfork fix/tcp-ecn-linerate-throughput
-
-# Repositório 2 — este testkit (scripts + exemplos + docs + patches)
-cd ..
-git remote add origin git@github.com:SEU_USUARIO/fstack-dpdk-linerate-testkit.git
-git push -u origin main
-```
-
-Depois de publicar o fork, edite `scripts/install_fstack_dpdk.sh` e troque o
-valor padrão de `FSTACK_REPO_URL` (hoje um placeholder
-`https://github.com/SEU_USUARIO/f-stack.git`) pela URL real.
+Este repositório está publicado em
+https://github.com/piccoli87/proj_f-stack_dpdk e inclui `f-stack-fork/` como
+subdiretório comum (não como submódulo nem repositório separado) — o
+histórico de commits original do fork não foi preservado, apenas o snapshot
+dos arquivos.
 
 ## Créditos
 
